@@ -1,7 +1,7 @@
 # Preview locally & deploy for free
 
-The build output is **pure static files** — 544 KB total, no backend, no database, no API keys.
-Anything that can serve a folder over HTTP can host it. That makes deployment a copy operation.
+The build output is **static files** and can still be hosted on Vercel or another static host. Optional cross-device
+sync uses Supabase Auth and Postgres; local storage remains the offline fallback.
 
 Two facts that shape everything below:
 
@@ -158,26 +158,24 @@ Opening a port on your home router is not recommended for a personal dashboard.
 
 ---
 
-## The important caveat about "all devices"
+## Supabase setup for cross-device sync
 
-**This app stores everything in `localStorage`, which is per browser and per device.** Publishing
-it does not sync data. Open it on your laptop and your phone and you will see two separate
-workspaces.
+1. Create a Supabase project. In **Authentication → URL Configuration**, allow your local development URL and deployed
+   Vercel URL as redirect URLs. Enable email sign-in and configure the email provider/template.
+2. In the Supabase SQL editor, run `supabase/migrations/20261014000000_personal_os_workspaces.sql`.
+   It creates a single JSON workspace row per user and enables Row Level Security. The browser's database access is
+   limited to the authenticated user's row; saving also uses a compare-and-save RPC to detect stale device copies.
+3. Copy `.env.example` to `.env.local` for local development and fill in the project URL and **publishable/anon** key.
+   These values are public browser configuration. Never use the service-role key or database password in Vite variables.
+4. In Vercel, add `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` to the Production, Preview, and Development
+   environments you use, then redeploy. Vite embeds these values at build time.
+5. Open Settings → Cross-device sync and request an email sign-in link. On first sign-in, choose whether to upload the
+   local workspace. If both cloud and local workspaces exist, download the backup for the copy being replaced before
+   choosing which copy to keep.
 
-That is a deliberate consequence of the requirements: no backend, no account, no credentials, no
-paid services. Your options:
-
-1. **Use it on one device** and keep the others as read-only mirrors.
-2. **Move data manually:** Settings → Export downloads a JSON backup; Settings → Restore loads it
-   on another device. Good for occasional transfers, not daily.
-3. **Use one browser profile everywhere** (e.g. Chrome signed in with sync enabled does *not* sync
-   localStorage — this does not work).
-4. **Add a real backend later.** The store is already isolated in `src/state/store.ts` behind
-   `persist()` / `hydrate()`, so swapping localStorage for a REST or Supabase call is one file.
-   That step is what costs money or a free-tier account.
-
-If daily multi-device sync matters to you, say so and I'll wire up a backend — it's a contained
-change, not a rewrite.
+Edits save locally first and cloud writes are debounced. If a second device changed the cloud copy since this device
+last loaded it, the compare-and-save call refuses the stale write and Settings asks you to resolve the copies. When
+offline, the workspace stays usable locally; reconnect and sync when online. Export and Restore continue to work.
 
 ---
 

@@ -16,16 +16,28 @@ import {
   useToast,
 } from '../components/ui';
 import { IconDownload, IconTrash, IconUpload } from '../components/icons';
+import { supabaseConfigured } from '../state/supabase';
 
 export function Settings() {
   const data = useStore((s) => s.data);
   const storageOk = useStore((s) => s.storageOk);
   const lastSavedAt = useStore((s) => s.lastSavedAt);
+  const syncStatus = useStore((s) => s.syncStatus);
+  const syncEmail = useStore((s) => s.syncEmail);
+  const pendingCloud = useStore((s) => s.pendingCloud);
+  const resolveSync = useStore((s) => s.resolveSync);
+  const syncNow = useStore((s) => s.syncNow);
+  const signIn = useStore((s) => s.signIn);
+  const signOut = useStore((s) => s.signOut);
   const toast = useToast();
   const fileRef = useRef<HTMLInputElement>(null);
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmDemo, setConfirmDemo] = useState(false);
   const [confirmClearDemo, setConfirmClearDemo] = useState(false);
+  const [email, setEmail] = useState('');
+  const [authMessage, setAuthMessage] = useState('');
+  const [localBackupFor, setLocalBackupFor] = useState<typeof data>();
+  const [cloudBackupFor, setCloudBackupFor] = useState<typeof pendingCloud>();
 
   const s = data.settings;
 
@@ -38,6 +50,16 @@ export function Settings() {
     a.click();
     URL.revokeObjectURL(url);
     toast({ title: 'Backup downloaded', tone: 'ok', body: 'Keep it somewhere safe — it restores everything, relationships included.' });
+  }
+
+  function downloadDataBackup(value: unknown, label: string) {
+    const blob = new Blob([JSON.stringify({ ...(value as object), exportedAt: new Date().toISOString() }, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `pos-${label}-backup-${todayISO()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
   }
 
   function restore(file: File) {
@@ -88,8 +110,8 @@ export function Settings() {
         <div>
           <h1 className="page-title">Settings</h1>
           <p className="page-sub">
-            Local-first: everything lives in this browser. Export a backup before clearing anything, or to move between
-            devices. No API keys, no accounts, no paid services.
+            Your workspace is saved on this device and can sync securely across devices after email sign-in. Backups and
+            restore remain available below.
           </p>
         </div>
         <div className="page-actions">
@@ -97,6 +119,54 @@ export function Settings() {
           {lastSavedAt && <Badge>saved {new Date(lastSavedAt).toLocaleTimeString()}</Badge>}
         </div>
       </div>
+
+      <Card title="Cross-device sync" subtitle="Private workspace sync using your Supabase account.">
+        <div className="stack">
+          {!supabaseConfigured ? (
+            <Note>Cloud sync is not configured for this deployment. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in the deployment environment.</Note>
+          ) : (
+            <>
+              <div className="row-wrap">
+                <Badge tone={syncStatus === 'synced' ? 'ok' : syncStatus === 'error' || syncStatus === 'conflict' ? 'danger' : syncStatus === 'offline' ? 'warn' : 'plain'}>
+                  {syncStatus === 'loading' ? 'Loading' : syncStatus === 'signed-out' ? 'Signed out' : syncStatus === 'offline' ? 'Offline · saved on this device' : syncStatus === 'syncing' ? 'Syncing' : syncStatus === 'synced' ? 'Synced' : syncStatus === 'needs-choice' ? 'Action needed' : syncStatus === 'conflict' ? 'Conflict needs a choice' : 'Sync error'}
+                </Badge>
+                {syncEmail && <span style={{ fontSize: 12, color: 'var(--text-2)' }}>{syncEmail}</span>}
+                {syncEmail && <Button onClick={() => void syncNow()}>Sync now</Button>}
+                {syncEmail && <Button onClick={() => void signOut()}>Sign out</Button>}
+              </div>
+              {!syncEmail && (
+                <form className="row-wrap" onSubmit={(e) => { e.preventDefault(); void signIn(email).then(() => setAuthMessage('Check your email for a sign-in link.')).catch((error: unknown) => setAuthMessage(error instanceof Error ? error.message : 'Could not send the sign-in link.')); }}>
+                  <Field label="Email address"><Input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" /></Field>
+                  <Button variant="primary" type="submit">Email me a sign-in link</Button>
+                </form>
+              )}
+              {authMessage && <Note>{authMessage}</Note>}
+              {syncStatus === 'needs-choice' && (
+                <div className="note warn">
+                  <strong>Upload this device’s workspace?</strong> Your cloud account has no workspace yet. Local data will stay on this device and be copied to your account only if you choose upload.
+                  <div className="row-wrap" style={{ marginTop: 10 }}>
+                    <Button variant="primary" onClick={() => void resolveSync('upload-local')}>Upload local workspace</Button>
+                    <Button onClick={() => void signOut()}>Keep using this device only</Button>
+                  </div>
+                </div>
+              )}
+              {syncStatus === 'conflict' && pendingCloud && (
+                <div className="note warn">
+                  <strong>Two workspace copies need a decision.</strong> Download a backup of the copy that will be replaced before choosing either option.
+                  <div className="row-wrap" style={{ marginTop: 10 }}>
+                    <Button onClick={() => { download(); setLocalBackupFor(data); }}>Download local backup</Button>
+                    <Button disabled={localBackupFor !== data} onClick={() => void resolveSync('use-cloud')}>Use cloud copy on this device</Button>
+                    <Button onClick={() => { downloadDataBackup(pendingCloud, 'cloud'); setCloudBackupFor(pendingCloud); }}>Download cloud backup</Button>
+                    <Button variant="primary" disabled={cloudBackupFor !== pendingCloud} onClick={() => void resolveSync('upload-local')}>Replace cloud with this device</Button>
+                  </div>
+                </div>
+              )}
+              {syncStatus === 'error' && <Note>Sync could not complete. Your local workspace remains available. Check the connection and Supabase setup, then choose Sync now.</Note>}
+              {syncStatus === 'offline' && <Note>Cloud sync is unavailable right now. Changes continue saving locally and will sync after reconnecting.</Note>}
+            </>
+          )}
+        </div>
+      </Card>
 
       <div className="grid grid-2">
         <Card title="Profile">
@@ -296,8 +366,8 @@ export function Settings() {
       <Card title="About this build" subtitle="What is implemented, and what is deliberately not.">
         <div className="stack">
           <p style={{ fontSize: 13, color: 'var(--text-2)' }}>
-            React + TypeScript, Vite, Zustand with localStorage persistence. No backend, no external analytics
-            integration, no AI API calls. Everything runs offline in the browser.
+            React + TypeScript, Vite, Zustand with localStorage persistence and optional Supabase account sync. The app
+            remains usable offline; cloud updates resume when connected.
           </p>
           <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12.5, display: 'grid', gap: 5, color: 'var(--text-2)' }}>
             <li>Task ranking is a deterministic weighted sum with a visible breakdown — no hidden model.</li>

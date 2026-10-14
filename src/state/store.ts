@@ -33,6 +33,7 @@ import { addDays, todayISO } from '../lib/date';
 import { buildSeedData } from '../lib/seed';
 import { clearRaw, readRaw, storageAvailable, writeRaw } from './storage';
 import { emptyData, migrate, stripSeed } from './defaults';
+import { currentUser, initializeAuth, loadWorkspace, onAuthChange, saveWorkspace, sendSignInLink, signOut as supabaseSignOut, supabaseConfigured } from './supabase';
 
 const MAX_EVENTS = 800;
 
@@ -42,6 +43,10 @@ export interface StoreState {
   storageOk: boolean;
   lastSavedAt?: string;
   importWarnings: string[];
+  syncStatus: 'loading' | 'signed-out' | 'offline' | 'syncing' | 'synced' | 'error' | 'needs-choice' | 'conflict';
+  syncEmail?: string;
+  pendingCloud?: AppData;
+  pendingCloudRevision?: number;
   /** actions */
   hydrate: () => void;
   resetEmpty: () => void;
@@ -50,6 +55,105 @@ export interface StoreState {
   replaceAll: (data: AppData, warnings?: string[]) => void;
   update: (fn: (draft: AppData) => AppData | void) => void;
   logEvent: (e: Omit<ProgressEvent, 'id'>) => void;
+  initializeSync: () => Promise<void>;
+  signIn: (email: string) => Promise<void>;
+  signOut: () => Promise<void>;
+  resolveSync: (choice: 'upload-local' | 'use-cloud') => Promise<void>;
+  syncNow: () => Promise<void>;
+}
+
+let cloudRevision: number | null = null;
+let syncReady = false;
+let pendingTimer: ReturnType<typeof setTimeout> | undefined;
+let authUnsubscribe: (() => void) | undefined;
+let activeSync = false;
+let syncInitialized = false;
+let activeAuthUserId = '';
+let authGeneration = 0;
+let pendingActivation: { email: string; generation: number } | undefined;
+
+function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, child]) => `${JSON.stringify(key)}:${stableJson(child)}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+function scheduleCloudWrite(data: AppData) {
+  if (!syncReady) return;
+  if (pendingTimer) clearTimeout(pendingTimer);
+  useStore.setState({ syncStatus: 'syncing' });
+  pendingTimer = setTimeout(() => { void writeCloud(data); }, 700);
+}
+async function writeCloud(data: AppData) {
+  if (!syncReady || activeSync) return;
+  activeSync = true;
+  const generation = authGeneration;
+  try {
+    const success = await saveWorkspace(data, cloudRevision);
+    if (generation !== authGeneration) return;
+    if (!success) {
+      const remote = await loadWorkspace();
+      if (generation !== authGeneration) return;
+      if (remote) {
+        const { data: cloud } = migrate(remote.data);
+        syncReady = false;
+        useStore.setState({ syncStatus: 'conflict', pendingCloud: cloud, pendingCloudRevision: remote.revision });
+      } else useStore.setState({ syncStatus: 'conflict' });
+      return;
+    }
+    const remote = await loadWorkspace();
+    if (generation !== authGeneration) return;
+    cloudRevision = remote?.revision ?? cloudRevision;
+    useStore.setState({ syncStatus: 'synced' });
+    if (JSON.stringify(useStore.getState().data) !== JSON.stringify(data)) scheduleCloudWrite(useStore.getState().data);
+  } catch (error) {
+    if (generation === authGeneration) useStore.setState({ syncStatus: navigator.onLine ? 'error' : 'offline', importWarnings: [`Cloud sync failed: ${errorMessage(error)}`] });
+  } finally {
+    activeSync = false;
+    if (pendingActivation) {
+      const pending = pendingActivation;
+      pendingActivation = undefined;
+      if (pending.generation === authGeneration) void activateUser(pending.email, pending.generation);
+    }
+  }
+}
+async function activateUser(email: string, generation = authGeneration) {
+  if (activeSync) { pendingActivation = { email, generation }; return; }
+  syncReady = false;
+  useStore.setState({ syncStatus: 'loading', syncEmail: email });
+  try {
+    const localRaw = readRaw();
+    const localExists = Boolean(localRaw);
+    const remote = await loadWorkspace();
+    if (generation !== authGeneration) return;
+    if (remote) {
+      const { data: cloud } = migrate(remote.data);
+      cloudRevision = remote.revision;
+      let copiesMatch = false;
+      if (localRaw) {
+        try { copiesMatch = stableJson(migrate(JSON.parse(localRaw)).data) === stableJson(cloud); }
+        catch { copiesMatch = false; }
+      }
+      if (localExists && !copiesMatch) useStore.setState({ pendingCloud: cloud, pendingCloudRevision: remote.revision, syncStatus: 'conflict' });
+      else {
+        const { data, warnings } = migrate(remote.data);
+        const savedAt = persist(data);
+        syncReady = true;
+        useStore.setState({ data, lastSavedAt: savedAt, importWarnings: warnings, syncStatus: 'synced' });
+      }
+    } else if (localExists) {
+      cloudRevision = null;
+      useStore.setState({ pendingCloud: undefined, pendingCloudRevision: undefined, syncStatus: 'needs-choice' });
+    } else {
+      cloudRevision = null;
+      syncReady = true;
+      useStore.setState({ syncStatus: 'synced' });
+    }
+  } catch (error) {
+    if (generation === authGeneration) useStore.setState({ syncStatus: navigator.onLine ? 'error' : 'offline', importWarnings: [`Cloud load failed: ${errorMessage(error)}`] });
+  }
 }
 
 function persist(data: AppData): string | undefined {
@@ -68,6 +172,7 @@ export const useStore = create<StoreState>((set, get) => ({
   hydrated: false,
   storageOk: true,
   importWarnings: [],
+  syncStatus: supabaseConfigured ? 'loading' : 'offline',
 
   hydrate: () => {
     const raw = readRaw();
@@ -87,6 +192,61 @@ export const useStore = create<StoreState>((set, get) => ({
     }
   },
 
+  initializeSync: async () => {
+    if (syncInitialized) return;
+    syncInitialized = true;
+    get().hydrate();
+    if (!supabaseConfigured) { set({ syncStatus: 'offline' }); return; }
+    // Local state is loaded first, but cloud writes remain disabled until the user's copy is reconciled.
+    try {
+      await initializeAuth();
+      const user = currentUser();
+      if (user) { activeAuthUserId = user.id; authGeneration += 1; await activateUser(user.email, authGeneration); }
+      else set({ syncStatus: 'signed-out' });
+    } catch (error) { set({ syncStatus: 'error', importWarnings: [`Sync setup failed: ${errorMessage(error)}`] }); }
+    authUnsubscribe?.();
+    authUnsubscribe = onAuthChange((session) => {
+      if (session?.user && session.user.id !== activeAuthUserId) {
+        activeAuthUserId = session.user.id;
+        authGeneration += 1;
+        void activateUser(session.user.email, authGeneration);
+      } else if (!session?.user) {
+        activeAuthUserId = '';
+        authGeneration += 1;
+        syncReady = false; cloudRevision = null;
+        if (pendingTimer) clearTimeout(pendingTimer);
+        set({ syncStatus: 'signed-out', syncEmail: undefined, pendingCloud: undefined, pendingCloudRevision: undefined });
+      }
+    });
+    window.addEventListener('offline', () => set({ syncStatus: 'offline' }));
+    window.addEventListener('online', () => {
+      if (syncReady) void get().syncNow();
+      else if (currentUser()) void activateUser(currentUser()!.email, authGeneration);
+      else set({ syncStatus: 'signed-out' });
+    });
+  },
+  signIn: async (email) => { await sendSignInLink(email); },
+  signOut: async () => { await supabaseSignOut(); },
+  resolveSync: async (choice) => {
+    const pending = get().pendingCloud;
+    const revision = get().pendingCloudRevision;
+    if (choice === 'use-cloud') {
+      if (!pending) return;
+      cloudRevision = revision ?? null;
+      syncReady = true;
+      const { data, warnings } = migrate(pending);
+      const savedAt = persist(data);
+      set({ data, lastSavedAt: savedAt, importWarnings: warnings, pendingCloud: undefined, pendingCloudRevision: undefined, syncStatus: 'synced' });
+    } else {
+      // Upload is an explicit, user-confirmed replacement of the cloud snapshot.
+      cloudRevision = revision ?? null;
+      syncReady = true;
+      set({ pendingCloud: undefined, pendingCloudRevision: undefined, syncStatus: 'syncing' });
+      await writeCloud(get().data);
+    }
+  },
+  syncNow: async () => { if (syncReady) await writeCloud(get().data); },
+
   update: (fn) => {
     const current = get().data;
     // `fn` may either mutate the shallow draft in place or return a replacement.
@@ -95,18 +255,21 @@ export const useStore = create<StoreState>((set, get) => ({
     const next = returned ?? draft;
     const savedAt = persist(next);
     set({ data: next, lastSavedAt: savedAt });
+    scheduleCloudWrite(next);
   },
 
   logEvent: (e) => {
     const next = logInto(get().data, e);
     const savedAt = persist(next);
     set({ data: next, lastSavedAt: savedAt });
+    scheduleCloudWrite(next);
   },
 
   resetEmpty: () => {
     const fresh = emptyData();
     const savedAt = persist(fresh);
     set({ data: fresh, lastSavedAt: savedAt, importWarnings: [] });
+    scheduleCloudWrite(fresh);
   },
 
   loadDemoData: (mode) => {
@@ -138,18 +301,21 @@ export const useStore = create<StoreState>((set, get) => ({
           };
     const savedAt = persist(next);
     set({ data: next, lastSavedAt: savedAt });
+    scheduleCloudWrite(next);
   },
 
   clearDemoData: () => {
     const next = stripSeed(get().data);
     const savedAt = persist(next);
     set({ data: next, lastSavedAt: savedAt });
+    scheduleCloudWrite(next);
   },
 
   replaceAll: (incoming, warnings = []) => {
     const { data, warnings: w } = migrate(incoming);
     const savedAt = persist(data);
     set({ data, lastSavedAt: savedAt, importWarnings: [...warnings, ...w] });
+    scheduleCloudWrite(data);
   },
 }));
 

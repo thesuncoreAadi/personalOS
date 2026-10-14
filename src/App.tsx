@@ -39,7 +39,7 @@ const ICONS: Record<RouteId, (p: { size?: number }) => React.ReactElement> = {
 };
 
 export function App() {
-  const hydrate = useStore((s) => s.hydrate);
+  const initializeSync = useStore((s) => s.initializeSync);
   const data = useStore((s) => s.data);
   const hydrated = useStore((s) => s.hydrated);
   const storageOk = useStore((s) => s.storageOk);
@@ -48,8 +48,8 @@ export function App() {
   const [navOpen, setNavOpen] = useState(false);
 
   useEffect(() => {
-    hydrate();
-  }, [hydrate]);
+    void initializeSync();
+  }, [initializeSync]);
 
   /* theme */
   useEffect(() => {
